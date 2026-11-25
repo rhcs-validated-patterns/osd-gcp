@@ -1,0 +1,149 @@
+# Stamp ClusterSecretStore + ExternalSecret from bootstrap ConfigMap openshift-gitops/osd-platform-metadata.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eso-from-metadata
+  namespace: external-secrets-operator
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eso-from-metadata
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: eso-from-metadata
+      containers:
+        - name: apply
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: METADATA_NS
+              value: openshift-gitops
+            - name: METADATA_NAME
+              value: osd-platform-metadata
+            - name: ESO_NS
+              value: external-secrets-operator
+            - name: ESO_SA
+              value: external-secrets-sa
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              set -euo pipefail
+
+              wait_for() {
+                local desc="$1"
+                shift
+                local i
+                for i in $(seq 1 90); do
+                  if "$@" >/dev/null 2>&1; then
+                    return 0
+                  fi
+                  sleep 10
+                done
+                echo "timed out waiting for ${desc}" >&2
+                exit 1
+              }
+
+              echo "Waiting for ConfigMap ${METADATA_NS}/${METADATA_NAME}"
+              wait_for "platform metadata ConfigMap" oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}"
+
+              GCP_PROJECT="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.gcpProjectId}')"
+              AUTH_METHOD="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.esoAuthMethod}')"
+              ESO_GCP_SA="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.esoGcpServiceAccountEmail}')"
+              PULL_SECRET_NAME="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.pullSecretSecretName}')"
+              K8S_WIF_AUD="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.esoWifKubernetesTokenAudience}')"
+              STS_WIF_AUD="$(oc -n "${METADATA_NS}" get configmap "${METADATA_NAME}" -o jsonpath='{.data.esoWifStsAudience}')"
+              PULL_SECRET_NAME="${PULL_SECRET_NAME:-redhat-pull-secret}"
+              K8S_WIF_AUD="${K8S_WIF_AUD:-openshift}"
+
+              if [[ -z "${GCP_PROJECT}" ]]; then
+                echo "ConfigMap ${METADATA_NAME} missing gcpProjectId (re-run apply + bootstrap)" >&2
+                exit 1
+              fi
+              if [[ -z "${STS_WIF_AUD}" || -z "${ESO_GCP_SA}" ]]; then
+                echo "ConfigMap ${METADATA_NAME} missing esoWifStsAudience or esoGcpServiceAccountEmail (re-run apply + bootstrap)" >&2
+                exit 1
+              fi
+
+              echo "Waiting for External Secrets Operator CRDs"
+              wait_for "ExternalSecretsConfig CRD" oc get crd externalsecretsconfigs.operator.openshift.io
+              wait_for "ClusterSecretStore CRD" oc get crd clustersecretstores.external-secrets.io
+              wait_for "ExternalSecret CRD" oc get crd externalsecrets.external-secrets.io
+
+              oc apply -f - <<EOF
+              apiVersion: operator.openshift.io/v1alpha1
+              kind: ExternalSecretsConfig
+              metadata:
+                name: cluster
+              spec:
+                controllerConfig:
+                  networkPolicies:
+                    - name: allow-external-secrets-egress
+                      componentName: ExternalSecretsCoreController
+                      egress:
+                        - ports:
+                            - port: 443
+                              protocol: TCP
+              EOF
+
+              if [[ "${AUTH_METHOD}" != "workloadIdentityFederation" ]]; then
+                echo "Expected esoAuthMethod=workloadIdentityFederation in ${METADATA_NAME} (got ${AUTH_METHOD})" >&2
+                exit 1
+              fi
+
+              wait_for "ESO ServiceAccount" oc -n "${ESO_NS}" get serviceaccount "${ESO_SA}"
+              oc apply -f - <<EOF
+              apiVersion: external-secrets.io/v1
+              kind: ClusterSecretStore
+              metadata:
+                name: customer-secret-manager
+              spec:
+                provider:
+                  gcpsm:
+                    projectID: "${GCP_PROJECT}"
+                    auth:
+                      workloadIdentityFederation:
+                        audience: "${STS_WIF_AUD}"
+                        gcpServiceAccountEmail: "${ESO_GCP_SA}"
+                        serviceAccountRef:
+                          name: ${ESO_SA}
+                          namespace: ${ESO_NS}
+                          audiences:
+                            - ${K8S_WIF_AUD}
+              EOF
+
+              oc apply -f - <<EOF
+              apiVersion: external-secrets.io/v1
+              kind: ExternalSecret
+              metadata:
+                name: additional-pull-secret
+                namespace: kube-system
+              spec:
+                refreshInterval: 1h
+                secretStoreRef:
+                  kind: ClusterSecretStore
+                  name: customer-secret-manager
+                target:
+                  name: additional-pull-secret
+                  creationPolicy: Merge
+                  deletionPolicy: Retain
+                  template:
+                    engineVersion: v2
+                    type: kubernetes.io/dockerconfigjson
+                    data:
+                      .dockerconfigjson: "{{ .dockerconfigjson }}"
+                data:
+                  - secretKey: dockerconfigjson
+                    remoteRef:
+                      key: ${PULL_SECRET_NAME}
+              EOF
+
+              echo "ESO ClusterSecretStore and ExternalSecret applied from platform metadata"

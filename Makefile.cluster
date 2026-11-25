@@ -1,0 +1,107 @@
+SHELL := /bin/bash
+ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+TF_DIR := $(ROOT_DIR)/terraform
+WIF_DIR := $(ROOT_DIR)/terraform/wif
+SCRIPTS := $(ROOT_DIR)/scripts
+
+CLUSTER_PROFILE ?= $(error CLUSTER_PROFILE must be set)
+CLUSTER_DIR := $(ROOT_DIR)/clusters/$(CLUSTER_PROFILE)
+TFVARS := $(CLUSTER_DIR)/terraform.tfvars
+INFRA_STATE := $(CLUSTER_DIR)/infrastructure.tfstate
+WIF_STATE := $(CLUSTER_DIR)/wif.tfstate
+
+export TFVARS
+export CLUSTER := $(CLUSTER_PROFILE)
+export DESTROY_CONFIRM
+# GNU Make exports recipe variables; do not let the profile name shadow scripts' CLUSTER_NAME.
+unexport CLUSTER_NAME
+export TF_DATA_DIR := $(abspath $(CLUSTER_DIR)/.terraform)
+export TF_WIF_DATA_DIR := $(abspath $(CLUSTER_DIR)/.terraform-wif)
+
+.PHONY: check-cluster check-tfvars init init-wif init-all plan apply _apply_impl wif.plan wif.apply _wif_apply_impl wif-undelete-roles destroy longrun.apply longrun.destroy kubeconfig show-credentials login bootstrap platform setup
+
+check-cluster:
+	@test -d "$(CLUSTER_DIR)" || (echo "Missing cluster directory $(CLUSTER_DIR)" >&2; exit 1)
+
+check-tfvars: check-cluster
+	@test -f "$(TFVARS)" || (echo "Missing $(TFVARS)" >&2; exit 1)
+
+init-wif: check-tfvars
+	@. "$(SCRIPTS)/lib.sh" && wif_init "$(WIF_STATE)"
+
+init: check-tfvars
+	@. "$(SCRIPTS)/lib.sh" && cluster_init "$(INFRA_STATE)"
+
+init-all: init-wif init
+
+wif.plan: init-wif
+	@. "$(SCRIPTS)/lib.sh" && export_tf_var_pull_secret_path; \
+	TF_DATA_DIR="$(TF_WIF_DATA_DIR)" terraform -chdir="$(WIF_DIR)" plan -var-file="$(TFVARS)"
+
+wif.apply: check-tfvars
+	@. "$(SCRIPTS)/lib.sh" && preflight_mutating
+	@$(MAKE) -f $(lastword $(MAKEFILE_LIST)) CLUSTER_PROFILE=$(CLUSTER_PROFILE) _wif_apply_impl
+
+_wif_apply_impl: init-wif
+	@set -e; \
+	. "$(SCRIPTS)/lib.sh" && export_tf_var_pull_secret_path; \
+	TF_DATA_DIR="$(TF_WIF_DATA_DIR)" terraform -chdir="$(WIF_DIR)" apply -auto-approve -var-file="$(TFVARS)"
+
+plan: init-all
+	@. "$(SCRIPTS)/lib.sh" && export_tf_var_pull_secret_path; \
+	echo "Planning WIF config (phase 1)..."; \
+	TF_DATA_DIR="$(TF_WIF_DATA_DIR)" terraform -chdir="$(WIF_DIR)" plan -var-file="$(TFVARS)"; \
+	echo ""; \
+	echo "Planning cluster stack (phase 2)..."; \
+	terraform -chdir="$(TF_DIR)" plan -var-file="$(TFVARS)"
+
+apply: check-tfvars
+	@. "$(SCRIPTS)/lib.sh" && preflight_mutating
+	@$(MAKE) -f $(lastword $(MAKEFILE_LIST)) CLUSTER_PROFILE=$(CLUSTER_PROFILE) _apply_impl
+
+_apply_impl: init-all
+	@set -e; \
+	. "$(SCRIPTS)/lib.sh" && export_tf_var_pull_secret_path; \
+	echo "Step 1: Creating WIF config in OCM..."; \
+	TF_DATA_DIR="$(TF_WIF_DATA_DIR)" terraform -chdir="$(WIF_DIR)" apply -auto-approve -var-file="$(TFVARS)"; \
+	echo ""; \
+	echo "Step 2: Applying VPC + OSD cluster..."; \
+	terraform -chdir="$(TF_DIR)" apply -auto-approve -var-file="$(TFVARS)"
+
+destroy: check-tfvars
+	@. "$(SCRIPTS)/lib.sh" && preflight_mutating
+	@export TFVARS="$(TFVARS)" CLUSTER_PROFILE="$(CLUSTER_PROFILE)" DESTROY_CONFIRM="$(DESTROY_CONFIRM)"; \
+	bash $(SCRIPTS)/destroy.sh
+
+longrun.apply: check-tfvars
+	@bash $(SCRIPTS)/cluster-longrun.sh "$(CLUSTER_PROFILE)" apply
+
+longrun.destroy: check-tfvars
+	@bash $(SCRIPTS)/cluster-longrun.sh "$(CLUSTER_PROFILE)" destroy --confirm
+
+wif-undelete-roles: check-tfvars
+	@export TFVARS="$(TFVARS)"; \
+	bash "$(SCRIPTS)/gcp-undelete-wif-custom-roles.sh" $(WIF_UNDELETE_ARGS)
+
+kubeconfig: setup check-tfvars
+	@export TFVARS="$(TFVARS)"; \
+	bash $(SCRIPTS)/credentials.sh request
+
+show-credentials: setup check-tfvars
+	@export TFVARS="$(TFVARS)"; \
+	bash $(SCRIPTS)/credentials.sh show
+
+login: setup check-tfvars
+	@export TFVARS="$(TFVARS)"; \
+	bash $(SCRIPTS)/credentials.sh login
+
+bootstrap: login
+	@export TFVARS="$(TFVARS)" CLUSTER="$(CLUSTER_PROFILE)"; \
+	bash $(SCRIPTS)/gitops-bootstrap.sh bootstrap
+
+platform: check-tfvars init
+	@export TFVARS="$(TFVARS)" CLUSTER_PROFILE="$(CLUSTER_PROFILE)" CLUSTER="$(CLUSTER_PROFILE)"; \
+	bash $(SCRIPTS)/platform.sh
+
+setup:
+	bash $(SCRIPTS)/setup.sh
